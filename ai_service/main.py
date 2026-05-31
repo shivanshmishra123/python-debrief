@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, UploadFile, File
 from pydantic import BaseModel, Field
 from typing import List, Optional
 from enum import Enum
@@ -8,9 +8,27 @@ from google import genai
 from google.genai import types
 from pinecone import Pinecone
 import os
-from dotenv import load_dotenv 
+import tempfile
 
-load_dotenv() 
+# Ensure ffmpeg bin directory is in PATH on Windows so Whisper can find it
+ffmpeg_dir = r"C:\Users\13shi\AppData\Local\Microsoft\WinGet\Packages\Gyan.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe\ffmpeg-8.1.1-full_build\bin"
+if os.path.exists(ffmpeg_dir) and ffmpeg_dir not in os.environ["PATH"]:
+    os.environ["PATH"] += os.pathsep + ffmpeg_dir
+
+import whisper
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# =============================================================
+# WHISPER MODEL — loaded ONCE at startup, reused for every call
+# Why? Loading the model takes ~2-5 seconds. We don't want that
+# delay on every request, so we load it globally when the app starts.
+# 'base' gives a good balance of speed and accuracy on CPU.
+# =============================================================
+print("⏳ Loading Whisper base model (first time may download ~142 MB)...")
+whisper_model = whisper.load_model("base")
+print("✅ Whisper model loaded and ready!")
 
 app = FastAPI(title="Meeting Debrief AI Service")
 
@@ -63,7 +81,7 @@ async def extract_structured_data(payload: TranscriptRequest):
     
     try:
         response = gemini_client.models.generate_content(
-            model='gemini-3.5-flash',
+            model='gemini-2.5-flash',
             contents=payload.transcript,
             config=types.GenerateContentConfig(
                 system_instruction=system_instruction,
@@ -182,7 +200,7 @@ async def query_meetings(payload: QueryPayload):
     """
 
     llm_response = gemini_client.models.generate_content(
-        model="gemini-3.5-flash",
+        model="gemini-2.5-flash",
         contents=prompt
     )
 
@@ -194,3 +212,71 @@ async def query_meetings(payload: QueryPayload):
         "answer": llm_response.text,
         "sources_used": len(retrieved_chunks)
     }
+
+
+# ==========================================
+# AUDIO TRANSCRIPTION ENDPOINT
+# ==========================================
+# KEY CONCEPT: UploadFile is FastAPI's way of receiving file uploads.
+# The browser sends the MP3 as multipart/form-data — FastAPI unwraps
+# it and gives us the file as a Python object we can read from.
+@app.post("/api/transcribe")
+async def transcribe_audio(audio: UploadFile = File(...)):
+    print(f"\n🎙️ Received audio file: {audio.filename} ({audio.content_type})")
+
+    # STEP 1: Validate file type
+    # We only accept audio formats that Whisper supports.
+    allowed_types = ["audio/mpeg", "audio/mp3", "audio/wav", "audio/x-wav",
+                     "audio/mp4", "audio/m4a", "audio/ogg", "audio/webm"]
+    if audio.content_type not in allowed_types:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported file type: {audio.content_type}. Please upload an MP3, WAV, or M4A file."
+        )
+
+    # STEP 2: Save the uploaded bytes to a TEMPORARY file on disk
+    # WHY? Whisper needs a file PATH to read from — it can't read from
+    # raw bytes in memory directly. tempfile.NamedTemporaryFile creates
+    # a file that automatically gets deleted when we're done.
+    # delete=False means we control deletion manually (needed on Windows).
+    suffix = os.path.splitext(audio.filename)[1] or ".mp3"  # preserve extension
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp_file:
+        tmp_path = tmp_file.name
+        content = await audio.read()  # read all bytes from the upload
+        tmp_file.write(content)       # write them to disk
+
+    print(f"   -> Saved to temp file: {tmp_path}")
+
+    try:
+        # STEP 3: Run Whisper transcription
+        # HOW WHISPER WORKS:
+        # It converts audio to a mel spectrogram (a visual representation
+        # of frequencies over time), then runs it through a transformer
+        # model trained on 680,000 hours of audio. It outputs text.
+        # fp16=False means we use 32-bit floats — required on CPU (not GPU).
+        print("🧠 Running Whisper transcription...")
+        result = whisper_model.transcribe(tmp_path, fp16=False)
+
+        # result["text"] is the full raw transcript as a single string
+        # result["segments"] contains word-level timestamps (for future diarization)
+        transcript_text = result["text"].strip()
+
+        print(f"✅ Transcription complete! ({len(transcript_text)} characters)")
+        print(f"   Preview: {transcript_text[:200]}...")
+
+        return {
+            "transcript": transcript_text,
+            "duration_seconds": result.get("segments", [{}])[-1].get("end", 0) if result.get("segments") else 0,
+            "language": result.get("language", "en")
+        }
+
+    except Exception as e:
+        print(f"❌ Whisper transcription failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Transcription failed: {str(e)}")
+
+    finally:
+        # STEP 4: Always clean up the temp file, even if an error occurred
+        # The 'finally' block runs whether or not an exception was raised.
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+            print(f"   -> Cleaned up temp file: {tmp_path}")
