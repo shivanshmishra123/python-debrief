@@ -13,26 +13,9 @@ from google.genai import types
 from pinecone import Pinecone
 import os
 import tempfile
-
-# Ensure ffmpeg bin directory is in PATH on Windows so Whisper can find it
-ffmpeg_dir = r"C:\Users\13shi\AppData\Local\Microsoft\WinGet\Packages\Gyan.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe\ffmpeg-8.1.1-full_build\bin"
-if os.path.exists(ffmpeg_dir) and ffmpeg_dir not in os.environ["PATH"]:
-    os.environ["PATH"] += os.pathsep + ffmpeg_dir
-
-import whisper
 from dotenv import load_dotenv
 
 load_dotenv()
-
-# =============================================================
-# WHISPER MODEL — loaded ONCE at startup, reused for every call
-# Why? Loading the model takes ~2-5 seconds. We don't want that
-# delay on every request, so we load it globally when the app starts.
-# 'base' gives a good balance of speed and accuracy on CPU.
-# =============================================================
-print("⏳ Loading Whisper base model (first time may download ~142 MB)...")
-whisper_model = whisper.load_model("base")
-print("✅ Whisper model loaded and ready!")
 
 app = FastAPI(title="Meeting Debrief AI Service")
 
@@ -277,30 +260,35 @@ async def transcribe_audio(audio: UploadFile = File(...)):
     print(f"   -> Saved to temp file: {tmp_path}")
 
     try:
-        # STEP 3: Run Whisper transcription
-        # HOW WHISPER WORKS:
-        # It converts audio to a mel spectrogram (a visual representation
-        # of frequencies over time), then runs it through a transformer
-        # model trained on 680,000 hours of audio. It outputs text.
-        # fp16=False means we use 32-bit floats — required on CPU (not GPU).
-        print("🧠 Running Whisper transcription...")
-        result = whisper_model.transcribe(tmp_path, fp16=False)
-
-        # result["text"] is the full raw transcript as a single string
-        # result["segments"] contains word-level timestamps (for future diarization)
-        transcript_text = result["text"].strip()
+        # STEP 3: Run Gemini File API transcription
+        print("🧠 Uploading audio to Gemini File API...")
+        audio_file = gemini_client.files.upload(file=tmp_path)
+        
+        print("🗣️ Transcribing audio using Gemini 2.5 Flash...")
+        response = gemini_client.models.generate_content(
+            model='gemini-2.5-flash',
+            contents=[audio_file, "Transcribe this audio file word-for-word. Do not summarize or add any extra commentary. Just return the transcription."]
+        )
+        transcript_text = response.text.strip()
+        
+        # Clean up file from Gemini cloud storage
+        try:
+            gemini_client.files.delete(name=audio_file.name)
+            print("🗑️ Cleaned up file from Gemini File API.")
+        except Exception as e:
+            print(f"⚠️ Failed to delete file from Gemini storage: {e}")
 
         print(f"✅ Transcription complete! ({len(transcript_text)} characters)")
         print(f"   Preview: {transcript_text[:200]}...")
 
         return {
             "transcript": transcript_text,
-            "duration_seconds": result.get("segments", [{}])[-1].get("end", 0) if result.get("segments") else 0,
-            "language": result.get("language", "en")
+            "duration_seconds": 0,
+            "language": "en"
         }
 
     except Exception as e:
-        print(f"❌ Whisper transcription failed: {e}")
+        print(f"❌ Transcription failed: {e}")
         raise HTTPException(status_code=500, detail=f"Transcription failed: {str(e)}")
 
     finally:

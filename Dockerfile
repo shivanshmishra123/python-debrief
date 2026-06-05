@@ -1,8 +1,5 @@
 FROM python:3.11-slim
 
-# Install ffmpeg (required by Whisper to process audio formats)
-RUN apt-get update && apt-get install -y ffmpeg && rm -rf /var/lib/apt/lists/*
-
 WORKDIR /app
 
 # Copy and install dependencies

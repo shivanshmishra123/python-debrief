@@ -4,6 +4,4 @@ pydantic
 google-genai
 pinecone
 python-dotenv
-openai-whisper
-python-multipart
-ffmpeg-python
+python-multipart
