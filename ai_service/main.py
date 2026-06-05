@@ -51,24 +51,32 @@ class ExtractedItemSchema(BaseModel):
     type: ItemType
     content: str = Field(description="The actual extracted text for this item.")
 
+class HistoricItem(BaseModel):
+    id: str
+    type: str
+    content: str
+
 class ExtractionResponse(BaseModel):
     items: List[ExtractedItemSchema]
+    drifted_ids: List[str] = Field(default_factory=list, description="IDs of historic items that are now superseded, completed, or drifted.")
 
 class TranscriptRequest(BaseModel):
     transcript: str
+    history: Optional[List[HistoricItem]] = None
 
 # ==========================================
 # UNIFIED STRUCTURED EXTRACTION ENDPOINT
 # ==========================================
 @app.post("/api/extract-structured", response_model=ExtractionResponse)
 async def extract_structured_data(payload: TranscriptRequest):
-    print("\n🧩 Extracting structured data from transcript using Gemini...")
+    print("\n🧩 Extracting structured data and checking for drifts...")
     
-    # Blended prompt utilizing the robust corporate analyst guidelines
+    input_contents = f"Transcript:\n{payload.transcript}"
+    
     system_instruction = """
     You are an expert corporate meeting analyst. Your task is to process meeting transcripts and extract key structured data.
 
-    Analyze the provided transcript and extract items into exactly four categories:
+    Part 1: Analyze the provided transcript and extract NEW items into exactly four categories:
     1. DECISION: Finalized choices, approvals, or strategic directions agreed upon.
     2. ACTION_ITEM: Specific tasks assigned to individuals or teams.
     3. OPEN_QUESTION: Unresolved issues, blockers, or topics tabled for future discussion.
@@ -79,10 +87,27 @@ async def extract_structured_data(payload: TranscriptRequest):
     - Extract atomic, self-contained points.
     """
     
+    if payload.history:
+        print(f"📊 Reconciling with {len(payload.history)} historic items from thread history...")
+        history_str = "\n".join([f"- ID: {item.id} | Type: {item.type} | Content: {item.content}" for item in payload.history])
+        input_contents = f"Transcript:\n{payload.transcript}\n\n---\n\nHistoric Active Items:\n{history_str}"
+        
+        system_instruction += """
+        
+        Part 2: Reconcile with History:
+        You are also provided with a list of "Historic Active Items" from previous meetings in this thread.
+        Compare the new transcript with these historic items. Identify if any historic items have been:
+        - Contradicted, updated, or superseded by a new decision or discussion (e.g. previous: "use Redis", new: "use PostgreSQL instead").
+        - Completed or resolved (e.g. action item like "Dave to write migration script" is mentioned as done in the new transcript).
+        
+        If an item matches either condition, you MUST add its exact "ID" to the `drifted_ids` list in the response.
+        Only add an ID to `drifted_ids` if it is clearly overridden or resolved by the current transcript.
+        """
+
     try:
         response = gemini_client.models.generate_content(
             model='gemini-2.5-flash',
-            contents=payload.transcript,
+            contents=input_contents,
             config=types.GenerateContentConfig(
                 system_instruction=system_instruction,
                 response_mime_type="application/json",
@@ -90,7 +115,7 @@ async def extract_structured_data(payload: TranscriptRequest):
                 temperature=0.2  # Kept low for high analytical accuracy
             )
         )
-        print("✅ Structured extraction complete!")
+        print("✅ Structured extraction and drift analysis complete!")
         return ExtractionResponse.model_validate_json(response.text)
     except Exception as e:
         print(f"❌ Error during extraction: {e}")
