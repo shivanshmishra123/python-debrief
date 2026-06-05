@@ -2,8 +2,12 @@ from fastapi import FastAPI, HTTPException, UploadFile, File
 from pydantic import BaseModel, Field
 from typing import List, Optional
 from enum import Enum
-from schema import MeetingPayload, QueryPayload
-from text_processor import get_overlapping_chunks
+try:
+    from schema import MeetingPayload, QueryPayload
+    from text_processor import get_overlapping_chunks
+except ImportError:
+    from ai_service.schema import MeetingPayload, QueryPayload
+    from ai_service.text_processor import get_overlapping_chunks
 from google import genai
 from google.genai import types
 from pinecone import Pinecone
