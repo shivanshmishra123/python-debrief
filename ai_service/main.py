@@ -19,6 +19,10 @@ load_dotenv()
 
 app = FastAPI(title="Meeting Debrief AI Service")
 
+@app.get("/healthz")
+async def health_check():
+    return {"status": "ok"}
+
 # Initialize Clients
 gemini_client = genai.Client() 
 pc = Pinecone()
